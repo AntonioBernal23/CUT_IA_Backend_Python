@@ -1,4 +1,3 @@
-from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -22,6 +21,9 @@ from contextlib import asynccontextmanager
 from app_core.yolo_runtime import YOLOModel
 from app_core.stats import count_by_class
 
+from fastapi import FastAPI, UploadFile, File, Security, HTTPException
+from fastapi.security.api_key import APIKeyHeader
+
 #Variables de entorno
 load_dotenv("../.env")
 
@@ -30,7 +32,7 @@ load_dotenv("../.env")
 # =========================
 STREAM_URL = os.getenv("STREAM_URL") # cambia a tu cámara
 SPRING_URL = os.getenv("SPRING_URL")
-
+INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 SEND_INTERVAL = 5  # segundos
 
 # =========================
@@ -47,7 +49,18 @@ running = True
 # =========================
 # MODELO YOLO
 # =========================
+
+import logging
+logging.getLogger("ultralytics").setLevel(logging.WARNING)
+
 yolo = YOLOModel(model_path="models/best.pt", device="cpu", conf=0.25)
+
+api_key_header = APIKeyHeader(name="X-Internal-Key", auto_error=False)
+
+def verify_api_key(key: str = Security(api_key_header)):
+    if key != INTERNAL_API_KEY:
+        raise HTTPException(status_code=401, detail="API Key inválida")
+
 # =====================
 # Obtener ip de camara
 # =====================
@@ -116,11 +129,22 @@ def camera_worker():
 
             # --- Envío periódico ---
             if time.time() - last_send >= SEND_INTERVAL:
-                try:
-                    requests.post(SPRING_URL, json=acumulado, timeout=2)
-                    print("Enviado:", acumulado)
-                except Exception as e:
-                    print("Error enviando:", e)
+                if acumulado:
+                    try:
+                        response = requests.post(
+                            SPRING_URL,
+                            json={"counts": acumulado}, 
+                            headers={"X-Internal-Key": INTERNAL_API_KEY},
+                            timeout=2)
+                        response.raise_for_status()
+                        print(f"Enviado a Spring: {acumulado} → status: {response.status_code}")
+
+                    except Exception as e:
+                        print(f"Error enviando a Spring: {e}")
+                        running = False
+                        os._exit(1)
+                else:
+                    print("Sin detecciones en este intervalo, no se envía.")
 
                 acumulado = {}
                 last_send = time.time()
@@ -263,32 +287,21 @@ async def predict_image(
 # STREAM (bajo demanda)
 # =========================
 @app.get("/stream")
-def stream():
+def stream(key: str = Security(api_key_header)):
+    verify_api_key(key)
     def generate():
         while True:
-            # Espera hasta 1s a que el worker deposite un frame nuevo
             frame_event.wait(timeout=1.0)
             frame_event.clear()
-
             with lock:
                 if latest_annotated is None:
                     continue
                 frame = latest_annotated.copy()
-
-            # Codificación FUERA del lock — no bloquea al worker
-            _, jpeg = cv2.imencode(
-                ".jpg", frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 70]
-            )
-
+            _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" +
                 jpeg.tobytes() +
                 b"\r\n"
             )
-
-    return StreamingResponse(
-        generate(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
