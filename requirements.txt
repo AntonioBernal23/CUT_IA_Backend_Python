@@ -1,0 +1,22 @@
+# Web & API
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+py-eureka-client==0.11.3
+python-multipart==0.0.9
+pydantic==2.9.2
+requests==2.32.3
+
+# Procesamiento de Datos y Visión
+numpy==1.26.4
+opencv-python==4.11.0.86
+Pillow==11.2.1
+matplotlib==3.10.0
+pandas==2.2.3
+openpyxl==3.1.2
+pyyaml==6.0.2
+tqdm==4.67.1
+
+# IA
+ultralytics==8.3.159
+
+python-dotenv==1.0.1
