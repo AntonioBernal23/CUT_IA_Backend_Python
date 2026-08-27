@@ -10,6 +10,7 @@ services:
         - PYTHON_YOLO_PORT=${PYTHON_YOLO_PORT}
         - STREAM_URL=${STREAM_URL}
         - SPRING_URL=${SPRING_URL}
+        - INTERNAL_API_KEY=${INTERNAL_API_KEY}
       networks:
         - cut_ia_network
       restart: on-failure
