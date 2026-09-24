@@ -6,8 +6,6 @@ from pathlib import Path
 import numpy as np
 import cv2
 
-import json
-
 import os
 from dotenv import load_dotenv
 
@@ -34,6 +32,10 @@ STREAM_URL = os.getenv("STREAM_URL") # cambia a tu cámara
 SPRING_URL = os.getenv("SPRING_URL")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 SEND_INTERVAL = 5  # segundos
+
+# URLs derivadas
+SPRING_DETECTIONS_URL = f"{SPRING_URL}/detections"
+SPRING_BEHAVIOR_URL   = f"{SPRING_URL}/behavior" 
 
 # =========================
 # ESTADO GLOBAL
@@ -78,22 +80,74 @@ def get_stream_source(stream_value: str | None):
     if stream_value.startswith(("http://", "https://", "rtsp://")):
         return stream_value
 
-    # Cualquier otra cosa → intenta usarlo tal cual
-    return stream_value
+# =========================
+# DEDUPLICACIÓN POR CAMBIO DE ESTADO
+# =========================
+FRAME_SKIP = 5
+CONFIRMATIONS_NEEDED = 3  # frames consecutivos para confirmar un cambio
+
+_last_behavior: dict[int, str]         = {}  # {track_id: ultimo_label_confirmado}
+_last_seen:     dict[int, float]        = {}  # {track_id: timestamp ultima vez visto}
+_pending:       dict[int, tuple[str, int]] = {}  # {track_id: (label_candidato, contador)}
+_state_lock = threading.Lock()
+
+def should_send(track_id: int, label: str) -> bool:
+    """Envía solo si el comportamiento cambió Y se confirmó N frames consecutivos."""
+    now = time.time()
+    with _state_lock:
+        _last_seen[track_id] = now
+
+        pending_label, count = _pending.get(track_id, (label, 0))
+
+        if pending_label == label:
+            count += 1
+        else:
+            pending_label = label
+            count = 1
+
+        _pending[track_id] = (pending_label, count)
+
+        if count >= CONFIRMATIONS_NEEDED:
+            ultimo = _last_behavior.get(track_id)
+            if ultimo != label:
+                _last_behavior[track_id] = label
+                return True
+
+        return False
+
+def limpiar_tracks_viejos(max_age_segundos: int = 120):
+    now = time.time()
+    with _state_lock:
+        expirados = [
+            tid for tid, ts in _last_seen.items()
+            if now - ts > max_age_segundos
+        ]
+        for tid in expirados:
+            _last_behavior.pop(tid, None)
+            _last_seen.pop(tid, None)
+            _pending.pop(tid, None)
+
 
 # =========================
-# WORKER (cámara + YOLO + envío)
+# CAMERA WORKER
 # =========================
 def camera_worker():
     global latest_frame, latest_annotated, running
 
     print("Worker iniciado...")
 
+    send_errors = 0
+    MAX_ERRORS = 5
+    frame_count = 0
+    last_cleanup = time.time()
+    last_stats_send = time.time()
+
+    SPRING_BEHAVIOR_URL = f"{SPRING_URL}/behavior"
+
     while running:
         print("Conectando a cámara...")
         cap = cv2.VideoCapture(get_stream_source(STREAM_URL))
 
-        # Intento de apertura
         if not cap.isOpened():
             print("No se pudo abrir el stream, reintentando en 2s...")
             time.sleep(2)
@@ -101,58 +155,115 @@ def camera_worker():
 
         print("Conectado a la cámara")
 
-        last_send = time.time()
-        acumulado = {}
-
         while running:
             ret, frame = cap.read()
 
-            # Si falla lectura, salimos para reconectar
             if not ret or frame is None:
                 print("Frame perdido / stream caído, reconectando...")
                 break
 
-            # --- YOLO (una sola vez) ---
-            out = yolo.detect_image(frame)
+            frame_count += 1
+
+            # --- THROTTLE: actualiza stream pero salta YOLO ---
+            if frame_count % FRAME_SKIP != 0:
+                with lock:
+                    latest_frame = frame.copy()
+                    if latest_annotated is None:
+                        latest_annotated = frame.copy()
+                frame_event.set()
+                time.sleep(0.01)
+                continue
+
+            # --- YOLO TRACKING ---
+            out = yolo.detect_image(frame, return_crops=True)
             annotated = out.get("annotated", frame)
 
-            # Guardar frames (thread-safe)
             with lock:
                 latest_frame = frame.copy()
                 latest_annotated = annotated.copy()
             frame_event.set()
 
-            # --- Stats ---
-            dist = count_by_class(out.get("boxes"), out.get("names"))
-            for k, v in dist.items():
-                acumulado[k] = acumulado.get(k, 0) + v
+            crops = out.get("crops", [])
 
-            # --- Envío periódico ---
-            if time.time() - last_send >= SEND_INTERVAL:
-                if acumulado:
-                    try:
-                        response = requests.post(
-                            SPRING_URL,
-                            json={"counts": acumulado}, 
-                            headers={"X-Internal-Key": INTERNAL_API_KEY},
-                            timeout=2)
-                        response.raise_for_status()
-                        print(f"Enviado a Spring: {acumulado} → status: {response.status_code}")
+            if not crops:
+                print("Sin detecciones en este frame.")
+                time.sleep(0.01)
+                continue
 
-                    except Exception as e:
-                        print(f"Error enviando a Spring: {e}")
+            # --- ESTADÍSTICAS AGREGADAS ---
+            if time.time() - last_stats_send >= SEND_INTERVAL:
+                counts = {}
+                for c in crops:
+                    counts[c["label"]] = counts.get(c["label"], 0) + 1
+
+                try:
+                    r = requests.post(
+                    SPRING_DETECTIONS_URL,
+                    json={"counts": counts},
+                    headers={"X-Internal-Key": INTERNAL_API_KEY},
+                    timeout=2,
+                    )
+                    r.raise_for_status()
+                    print(f"[STATS] {counts} → {r.status_code}")
+                except requests.exceptions.RequestException as e:
+                    print(f"[STATS ERROR] {e}")
+                last_stats_send = time.time()
+
+            # --- DEDUPLICACIÓN + ENVÍO ---
+            for crop in crops:
+                track_id = crop.get("track_id", -1)
+                label    = crop["label"]
+
+                if not should_send(track_id, label):
+                    print(f"[SKIP] track_id={track_id} | {label} (sin cambio o pendiente confirmación)")
+                    continue
+
+                payload = {
+                    "timestamp": time.time(),
+                    "track_id":  track_id,
+                    "label":     label,
+                    "conf":      crop["conf"],
+                    "image_b64": crop["image_b64"],
+                }
+
+                try:
+                    response = requests.post(
+                        SPRING_BEHAVIOR_URL,
+                        json=payload,
+                        headers={"X-Internal-Key": INTERNAL_API_KEY},
+                        timeout=2
+                    )
+                    response.raise_for_status()
+                    print(f"[CAMBIO] track_id={track_id} | {label} ({crop['conf']:.2f}) → {response.status_code}")
+                    send_errors = 0
+
+                except requests.exceptions.Timeout:
+                    send_errors += 1
+                    print(f"[TIMEOUT {send_errors}/{MAX_ERRORS}] Spring no respondió")
+
+                except requests.exceptions.ConnectionError:
+                    send_errors += 1
+                    print(f"[CONN ERROR {send_errors}/{MAX_ERRORS}] No se pudo conectar a Spring")
+
+                except Exception as e:
+                    send_errors += 1
+                    print(f"[ERROR {send_errors}/{MAX_ERRORS}] {e}")
+
+                finally:
+                    if send_errors >= MAX_ERRORS:
+                        print("Demasiados errores consecutivos, deteniendo worker...")
+                        cap.release()
                         running = False
-                        os._exit(1)
-                else:
-                    print("Sin detecciones en este intervalo, no se envía.")
+                        return
 
-                acumulado = {}
-                last_send = time.time()
+            # --- LIMPIEZA PERIÓDICA DE TRACKS ---
+            if time.time() - last_cleanup > 60:
+                limpiar_tracks_viejos()
+                last_cleanup = time.time()
+                print("[CLEANUP] Tracks viejos eliminados")
 
-            # Pequeña pausa para no saturar CPU
             time.sleep(0.01)
 
-        # Liberar y reintentar conexión
         cap.release()
         print("Reconectando en 1s...")
         time.sleep(1)

@@ -11,6 +11,10 @@ services:
         - STREAM_URL=${STREAM_URL}
         - SPRING_URL=${SPRING_URL}
         - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+      devices:
+        - /dev/video0:/dev/video0
+      group_add:
+        - video
       networks:
         - cut_ia_network
       restart: on-failure
