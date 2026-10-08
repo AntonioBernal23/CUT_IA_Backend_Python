@@ -80,6 +80,8 @@ def get_stream_source(stream_value: str | None):
     if stream_value.startswith(("http://", "https://", "rtsp://")):
         return stream_value
 
+    return 0
+
 # =========================
 # DEDUPLICACIÓN POR CAMBIO DE ESTADO
 # =========================
@@ -131,6 +133,29 @@ def limpiar_tracks_viejos(max_age_segundos: int = 120):
 # =========================
 # CAMERA WORKER
 # =========================
+def open_camera(stream_value: str | None):
+    source = get_stream_source(stream_value)
+
+    # Cámara local V4L2
+    if isinstance(source, int):
+        cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+
+        if not cap.isOpened():
+            return cap
+
+        cap.set(
+            cv2.CAP_PROP_FOURCC,
+            cv2.VideoWriter_fourcc(*"BGR3")
+        )
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        return cap
+
+    # Cámara IP / RTSP / HTTP
+    return cv2.VideoCapture(source)
+
+
 def camera_worker():
     global latest_frame, latest_annotated, running
 
@@ -145,17 +170,22 @@ def camera_worker():
     SPRING_BEHAVIOR_URL = f"{SPRING_URL}/behavior"
 
     while running:
+
         print("Conectando a cámara...")
-        cap = cv2.VideoCapture(get_stream_source(STREAM_URL))
+
+        # AQUÍ faltaba crear cap
+        cap = open_camera(STREAM_URL)
 
         if not cap.isOpened():
             print("No se pudo abrir el stream, reintentando en 2s...")
+            cap.release()
             time.sleep(2)
             continue
 
         print("Conectado a la cámara")
 
         while running:
+
             ret, frame = cap.read()
 
             if not ret or frame is None:
@@ -166,21 +196,30 @@ def camera_worker():
 
             # --- THROTTLE: actualiza stream pero salta YOLO ---
             if frame_count % FRAME_SKIP != 0:
+
                 with lock:
                     latest_frame = frame.copy()
+
                     if latest_annotated is None:
                         latest_annotated = frame.copy()
+
                 frame_event.set()
+
                 time.sleep(0.01)
                 continue
 
             # --- YOLO TRACKING ---
-            out = yolo.detect_image(frame, return_crops=True)
+            out = yolo.detect_image(
+                frame,
+                return_crops=True
+            )
+
             annotated = out.get("annotated", frame)
 
             with lock:
                 latest_frame = frame.copy()
                 latest_annotated = annotated.copy()
+
             frame_event.set()
 
             crops = out.get("crops", [])
@@ -192,79 +231,136 @@ def camera_worker():
 
             # --- ESTADÍSTICAS AGREGADAS ---
             if time.time() - last_stats_send >= SEND_INTERVAL:
+
                 counts = {}
+
                 for c in crops:
-                    counts[c["label"]] = counts.get(c["label"], 0) + 1
+                    counts[c["label"]] = counts.get(
+                        c["label"],
+                        0
+                    ) + 1
 
                 try:
                     r = requests.post(
-                    SPRING_DETECTIONS_URL,
-                    json={"counts": counts},
-                    headers={"X-Internal-Key": INTERNAL_API_KEY},
-                    timeout=2,
+                        SPRING_DETECTIONS_URL,
+                        json={"counts": counts},
+                        headers={
+                            "X-Internal-Key": INTERNAL_API_KEY
+                        },
+                        timeout=2,
                     )
+
                     r.raise_for_status()
-                    print(f"[STATS] {counts} → {r.status_code}")
+
+                    print(
+                        f"[STATS] {counts} → {r.status_code}"
+                    )
+
                 except requests.exceptions.RequestException as e:
                     print(f"[STATS ERROR] {e}")
+
                 last_stats_send = time.time()
 
             # --- DEDUPLICACIÓN + ENVÍO ---
             for crop in crops:
+
                 track_id = crop.get("track_id", -1)
-                label    = crop["label"]
+                label = crop["label"]
 
                 if not should_send(track_id, label):
-                    print(f"[SKIP] track_id={track_id} | {label} (sin cambio o pendiente confirmación)")
+
+                    print(
+                        f"[SKIP] track_id={track_id} | "
+                        f"{label} "
+                        f"(sin cambio o pendiente confirmación)"
+                    )
+
                     continue
 
                 payload = {
                     "timestamp": time.time(),
-                    "track_id":  track_id,
-                    "label":     label,
-                    "conf":      crop["conf"],
+                    "track_id": track_id,
+                    "label": label,
+                    "conf": crop["conf"],
                     "image_b64": crop["image_b64"],
                 }
 
                 try:
+
                     response = requests.post(
                         SPRING_BEHAVIOR_URL,
                         json=payload,
-                        headers={"X-Internal-Key": INTERNAL_API_KEY},
+                        headers={
+                            "X-Internal-Key": INTERNAL_API_KEY
+                        },
                         timeout=2
                     )
+
                     response.raise_for_status()
-                    print(f"[CAMBIO] track_id={track_id} | {label} ({crop['conf']:.2f}) → {response.status_code}")
+
+                    print(
+                        f"[CAMBIO] track_id={track_id} | "
+                        f"{label} "
+                        f"({crop['conf']:.2f}) → "
+                        f"{response.status_code}"
+                    )
+
                     send_errors = 0
 
                 except requests.exceptions.Timeout:
+
                     send_errors += 1
-                    print(f"[TIMEOUT {send_errors}/{MAX_ERRORS}] Spring no respondió")
+
+                    print(
+                        f"[TIMEOUT {send_errors}/{MAX_ERRORS}] "
+                        f"Spring no respondió"
+                    )
 
                 except requests.exceptions.ConnectionError:
+
                     send_errors += 1
-                    print(f"[CONN ERROR {send_errors}/{MAX_ERRORS}] No se pudo conectar a Spring")
+
+                    print(
+                        f"[CONN ERROR {send_errors}/{MAX_ERRORS}] "
+                        f"No se pudo conectar a Spring"
+                    )
 
                 except Exception as e:
+
                     send_errors += 1
-                    print(f"[ERROR {send_errors}/{MAX_ERRORS}] {e}")
+
+                    print(
+                        f"[ERROR {send_errors}/{MAX_ERRORS}] {e}"
+                    )
 
                 finally:
+
                     if send_errors >= MAX_ERRORS:
-                        print("Demasiados errores consecutivos, deteniendo worker...")
+
+                        print(
+                            "Demasiados errores consecutivos, "
+                            "deteniendo worker..."
+                        )
+
                         cap.release()
                         running = False
                         return
 
             # --- LIMPIEZA PERIÓDICA DE TRACKS ---
             if time.time() - last_cleanup > 60:
+
                 limpiar_tracks_viejos()
+
                 last_cleanup = time.time()
-                print("[CLEANUP] Tracks viejos eliminados")
+
+                print(
+                    "[CLEANUP] Tracks viejos eliminados"
+                )
 
             time.sleep(0.01)
 
         cap.release()
+
         print("Reconectando en 1s...")
         time.sleep(1)
 
@@ -379,8 +475,15 @@ async def predict_image(
     names = out.get("names", {})
 
     if boxes is not None:
-        for x1, y1, x2, y2, conf_v, cls in boxes:
+        for box in boxes:
+
+            if len(box) == 7:
+                x1, y1, x2, y2, track_id, conf_v, cls = box
+            else:
+                x1, y1, x2, y2, conf_v, cls = box
+
             label = names.get(int(cls), str(int(cls)))
+
             boxes_json.append({
                 "x1": float(x1),
                 "y1": float(y1),

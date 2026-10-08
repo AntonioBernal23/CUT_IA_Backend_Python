@@ -1,23 +1,30 @@
 services:
-    python-yolo-service:
-      build:
-        context: .
-        dockerfile: Dockerfile
-      container_name: python-yolo-service
-      ports:
-        - "${PYTHON_YOLO_PORT}:8000"
-      environment:
-        - PYTHON_YOLO_PORT=${PYTHON_YOLO_PORT}
-        - STREAM_URL=${STREAM_URL}
-        - SPRING_URL=${SPRING_URL}
-        - INTERNAL_API_KEY=${INTERNAL_API_KEY}
-      devices:
-        - /dev/video0:/dev/video0
-      group_add:
-        - video
-      networks:
-        - cut_ia_network
-      restart: on-failure
+  python-yolo-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    container_name: python-yolo-service
+
+    ports:
+      - "${PYTHON_YOLO_PORT}:8000"
+
+    environment:
+      - PYTHON_YOLO_PORT=${PYTHON_YOLO_PORT}
+      - STREAM_URL=${STREAM_URL}
+      - SPRING_URL=${SPRING_URL}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+
+    devices:
+      - /dev/video0:/dev/video0
+
+    group_add:
+      - video
+
+    networks:
+      - cut_ia_network
+
+    restart: on-failure
 
 networks:
   cut_ia_network:
