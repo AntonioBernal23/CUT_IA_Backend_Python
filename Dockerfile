@@ -1,31 +1,28 @@
-# Imagen base
+# Imagen base ligera
 FROM python:3.10-slim
 
-# Evita problemas con logs
+# Evita que Python escriba archivos .pyc y fuerza logs en vivo
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Instalar dependencias del sistema (IMPORTANTE para OpenCV)
-RUN apt-get update && apt-get install -y \
-    libgl1 \
-    libglib2.0-0 \
+# Dependencias mínimas del sistema para OpenCV sin GUI
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Crear carpeta de trabajo
 WORKDIR /app
 
-# Copiar requirements primero (cache eficiente)
 COPY requirements.txt .
 
-# Instalar dependencias
+# 1. Instalar primero PyTorch / torchvision versión CPU (~180 MB en vez de ~2.5 GB)
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# 2. Instalar el resto de dependencias desde requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar todo el proyecto
 COPY . .
 
-# Exponer puerto de FastAPI
 EXPOSE 8000
 
-# Comando para iniciar
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
