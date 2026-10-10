@@ -13,7 +13,14 @@ from fastapi import FastAPI, Security, HTTPException
 from fastapi.security import APIKeyHeader
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from picamera2 import Picamera2
+
+# Importación condicional para evitar ModuleNotFoundError dentro del contenedor Docker
+try:
+    from picamera2 import Picamera2
+    HAS_PICAM2 = True
+except ImportError:
+    Picamera2 = None
+    HAS_PICAM2 = False
 
 from app_core.yolo_runtime import YOLOModel
 
@@ -90,15 +97,37 @@ def camera_worker():
     
     print("Iniciando trabajador de cámara...")
     
-    try:
-        picam2 = Picamera2()
-        config = picam2.create_video_configuration(main={"size": (640, 480), "format": "BGR888"})
-        picam2.configure(config)
-        picam2.start()
-        time.sleep(1.0)
-    except Exception as e:
-        logger.error(f"Error crítico al inicializar Picamera2: {e}")
-        return
+    picam2 = None
+    cap = None
+    use_picam = False
+
+    # 1. Intentar iniciar con Picamera2 si la librería existe
+    if HAS_PICAM2:
+        try:
+            picam2 = Picamera2()
+            config = picam2.create_video_configuration(main={"size": (640, 480), "format": "BGR888"})
+            picam2.configure(config)
+            picam2.start()
+            use_picam = True
+            time.sleep(1.0)
+            logger.info("Cámara iniciada con Picamera2")
+        except Exception as e:
+            logger.warning(f"No se pudo usar Picamera2: {e}")
+
+    # 2. Fallback a OpenCV (VideoCapture)
+    if not use_picam:
+        stream_src = os.getenv("STREAM_URL", "0").strip()
+        if stream_src.isdigit():
+            stream_src = int(stream_src)
+        
+        cap = cv2.VideoCapture(stream_src)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        
+        if not cap.isOpened():
+            logger.error(f"Error crítico: No se pudo abrir OpenCV VideoCapture en la fuente {stream_src}")
+            return
+        logger.info(f"Cámara iniciada con OpenCV VideoCapture ({stream_src})")
 
     frame_count = 0
     last_cleanup = time.time()
@@ -107,12 +136,23 @@ def camera_worker():
     # Cliente HTTP persistente para reutilizar conexiones TCP
     with httpx.Client(timeout=2.0, headers={"X-Internal-Key": INTERNAL_API_KEY}) as client:
         while running:
-            try:
-                frame = picam2.capture_array()
-            except Exception as e:
-                logger.error(f"Error capturando frame: {e}")
-                time.sleep(0.1)
-                continue
+            # Captura de frame según el motor activo
+            if use_picam and picam2:
+                try:
+                    frame = picam2.capture_array()
+                except Exception as e:
+                    logger.error(f"Error capturando frame con Picamera2: {e}")
+                    time.sleep(0.1)
+                    continue
+            else:
+                if cap and cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        time.sleep(0.05)
+                        continue
+                else:
+                    time.sleep(0.5)
+                    continue
 
             frame_count += 1
             
@@ -169,11 +209,15 @@ def camera_worker():
                 limpiar_tracks_viejos()
                 last_cleanup = now
 
-    try:
-        picam2.stop()
-        picam2.close()
-    except Exception:
-        pass
+    # Liberación de recursos
+    if picam2:
+        try:
+            picam2.stop()
+            picam2.close()
+        except Exception:
+            pass
+    if cap:
+        cap.release()
 
 
 @asynccontextmanager

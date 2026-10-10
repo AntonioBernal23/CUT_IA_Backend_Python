@@ -11,11 +11,11 @@ services:
 
     environment:
       - PYTHON_YOLO_PORT=${PYTHON_YOLO_PORT:-8000}
-      - STREAM_URL=${STREAM_URL}
-      - SPRING_URL=${SPRING_URL}
+      - STREAM_URL=${STREAM_URL:-0}
+      - SPRING_URL=${SPRING_URL:-http://localhost:8080}
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
 
-    # Permisos de hardware para acceder al sensor de la cámara en Raspberry Pi
+    # Permisos de hardware para acceder a la cámara en Raspberry Pi
     privileged: true
 
     devices:
