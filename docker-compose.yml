@@ -7,16 +7,23 @@ services:
     container_name: python-yolo-service
 
     ports:
-      - "${PYTHON_YOLO_PORT}:8000"
+      - "${PYTHON_YOLO_PORT:-8000}:8000"
 
     environment:
-      - PYTHON_YOLO_PORT=${PYTHON_YOLO_PORT}
+      - PYTHON_YOLO_PORT=${PYTHON_YOLO_PORT:-8000}
       - STREAM_URL=${STREAM_URL}
       - SPRING_URL=${SPRING_URL}
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
 
+    # Permisos de hardware para acceder al sensor de la cámara en Raspberry Pi
+    privileged: true
+
     devices:
       - /dev/video0:/dev/video0
+      - /dev/vchiq:/dev/vchiq
+
+    volumes:
+      - /run/udev:/run/udev:ro
 
     group_add:
       - video

@@ -1,24 +1,25 @@
-# Imagen base ligera
+# Imagen base ligera basada en Python 3.10
 FROM python:3.10-slim
 
-# Evita que Python escriba archivos .pyc y fuerza logs en vivo
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Dependencias mínimas del sistema para OpenCV sin GUI
+# Instalar paquetes requeridos por OpenCV headless y el subsistema de cámara de Raspberry Pi OS
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    libgl1 \
     libglib2.0-0 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
 
-# 1. Instalar primero PyTorch / torchvision versión CPU (~180 MB en vez de ~2.5 GB)
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# 1. Instalar versión PyTorch CPU ligera (~180MB en lugar de varios GBs)
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
 
-# 2. Instalar el resto de dependencias desde requirements.txt
+# 2. Instalar el resto de dependencias
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
