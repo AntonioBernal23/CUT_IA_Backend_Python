@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      platforms:
+        - linux/arm64
 
     container_name: python-yolo-service
 
@@ -15,12 +17,9 @@ services:
       - SPRING_URL=${SPRING_URL:-http://localhost:8080}
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
 
-    # Permisos de hardware para acceder a la cámara en Raspberry Pi
+    # libcamera necesita /dev/media*, /dev/dma_heap y /dev/v4l-subdev*.
+    # privileged los expone todos, por eso ya no se listan devices.
     privileged: true
-
-    devices:
-      - /dev/video0:/dev/video0
-      - /dev/vchiq:/dev/vchiq
 
     volumes:
       - /run/udev:/run/udev:ro

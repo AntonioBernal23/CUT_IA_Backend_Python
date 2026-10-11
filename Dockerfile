@@ -1,30 +1,43 @@
-# Imagen base ligera basada en Python 3.10
-FROM python:3.10-slim
+# Imagen base Debian Bookworm (misma base que Raspberry Pi OS Bookworm), arm64
+FROM debian:bookworm-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Instalar paquetes requeridos por OpenCV headless y el subsistema de cámara de Raspberry Pi OS
+# 1. Repositorio oficial de Raspberry Pi (ahí vive python3-picamera2)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    libgl1 \
-    libglib2.0-0 \
-    python3-pip \
+    curl gnupg ca-certificates \
+    && curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
+       | gpg --dearmor -o /usr/share/keyrings/raspberrypi.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/raspberrypi.gpg] http://archive.raspberrypi.com/debian/ bookworm main" \
+       > /etc/apt/sources.list.d/raspi.list \
     && rm -rf /var/lib/apt/lists/*
+
+# 2. Picamera2 + libcamera por apt, y librerías que necesita OpenCV
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-venv python3-pip \
+    python3-picamera2 \
+    libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Venv que VE los paquetes de apt (picamera2, libcamera)
+RUN python3 -m venv --system-site-packages /venv
+ENV PATH="/venv/bin:$PATH"
 
 WORKDIR /app
 
 COPY requirements.txt .
 
-# 1. Instalar versión PyTorch CPU ligera (~180MB en lugar de varios GBs)
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+# 4. PyTorch CPU ligero
+RUN pip install --no-cache-dir torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url https://pypi.org/simple
 
-# 2. Instalar el resto de dependencias
-RUN pip install --no-cache-dir -r requirements.txt
+# 5. Resto de dependencias. numpy<2 evita romper picamera2 (compilado con numpy 1.x)
+RUN pip install --no-cache-dir "numpy<2" -r requirements.txt
 
 COPY . .
 
 EXPOSE 8000
 
-# Se especifica api.main:app en lugar de main:app
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
