@@ -4,6 +4,10 @@ FROM debian:bookworm-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+# Evita que Ultralytics instale paquetes en runtime y rompa el entorno
+ENV YOLO_AUTOINSTALL=false
+ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
+
 # 1. Repositorio oficial de Raspberry Pi (ahí vive python3-picamera2)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gnupg ca-certificates \
@@ -26,15 +30,20 @@ ENV PATH="/venv/bin:$PATH"
 
 WORKDIR /app
 
+# Constraint: impide que cualquier paquete suba numpy a 2.x (picamera2 usa numpy 1.x)
+RUN echo "numpy<2" > /constraints.txt
+
 COPY requirements.txt .
 
 # 4. PyTorch CPU ligero
-RUN pip install --no-cache-dir torch torchvision \
+RUN pip install --no-cache-dir -c /constraints.txt torch torchvision \
     --index-url https://download.pytorch.org/whl/cpu \
     --extra-index-url https://pypi.org/simple
 
-# 5. Resto de dependencias. numpy<2 evita romper picamera2 (compilado con numpy 1.x)
-RUN pip install --no-cache-dir "numpy<2" -r requirements.txt
+# 5. Resto de dependencias.
+#    lapx: requerido por el tracker ByteTrack
+#    onnxruntime: requerido para cargar models/best.onnx
+RUN pip install --no-cache-dir -c /constraints.txt -r requirements.txt lapx onnxruntime
 
 COPY . .
 
