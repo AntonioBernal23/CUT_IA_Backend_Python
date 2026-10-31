@@ -1,6 +1,7 @@
 import os
 import time
 import queue
+import random
 import secrets
 import logging
 import threading
@@ -16,7 +17,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Importación condicional para evitar ModuleNotFoundError dentro del contenedor Docker
+# Importación condicional: en PC o dentro de Docker no existe picamera2
 try:
     from picamera2 import Picamera2
     HAS_PICAM2 = True
@@ -52,12 +53,17 @@ SPRING_URL = os.getenv("SPRING_URL", "http://localhost:8080").rstrip("/")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
 SPRING_DETECTIONS_URL = f"{SPRING_URL}/detections"
 SPRING_BEHAVIOR_URL = f"{SPRING_URL}/behavior"
+# Ruta del ImageController de Spring (ajústala en el .env si la renombras)
+SPRING_IMAGES_URL = os.getenv("SPRING_IMAGES_URL", f"{SPRING_URL}/api/dataset").rstrip("/")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "models/best.onnx")
 MODEL_CONF = float(os.getenv("MODEL_CONF", "0.25"))
 
 FRAME_W = int(os.getenv("FRAME_W", "640"))
 FRAME_H = int(os.getenv("FRAME_H", "480"))
+
+# Formato de Picamera2. Si los colores salen invertidos (rojo/azul), pon RGB888 en el .env
+PICAM_FORMAT = os.getenv("PICAM_FORMAT", "BGR888")
 
 # Máximo de inferencias por segundo (limita CPU y temperatura de la Pi)
 INFER_FPS = float(os.getenv("INFER_FPS", "10"))
@@ -67,9 +73,16 @@ CONFIRMATIONS_NEEDED = 3
 SEND_INTERVAL = 5            # seg entre envíos de estadísticas
 SPRING_QUEUE_MAX = 50        # cola de envíos pendientes
 SPRING_TIMEOUT = 3.0
+SPRING_UPLOAD_TIMEOUT = 10.0 # subir una imagen tarda más que un JSON
 SPRING_PROBE_EVERY = 30      # seg: chequeo de conexión cuando no hay tráfico
 STATS_LOG_EVERY = 60         # seg: resumen periódico en logs
 JPEG_QUALITY_STREAM = 65
+
+# Muestreo de imágenes crudas para el dataset (antes de que YOLO las procese)
+SAMPLE_ENABLED = os.getenv("SAMPLE_ENABLED", "true").lower() == "true"
+SAMPLE_MIN_S = float(os.getenv("SAMPLE_MIN_S", "30"))    # intervalo mínimo entre muestras
+SAMPLE_MAX_S = float(os.getenv("SAMPLE_MAX_S", "120"))   # intervalo máximo entre muestras
+JPEG_QUALITY_SAMPLE = int(os.getenv("JPEG_QUALITY_SAMPLE", "90"))
 
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 
@@ -138,15 +151,15 @@ class CameraSource:
     # ---- apertura de backends ----
     def _open_picam(self):
         if not HAS_PICAM2:
-            log_cam.info("Picamera2 no disponible (¿corriendo en Docker?), se usará OpenCV")
+            log_cam.info("Picamera2 no disponible (PC o Docker), se usará OpenCV")
             return None
         try:
             cam = Picamera2()
-            cfg = cam.create_video_configuration(main={"size": (FRAME_W, FRAME_H), "format": "BGR888"})
+            cfg = cam.create_video_configuration(main={"size": (FRAME_W, FRAME_H), "format": PICAM_FORMAT})
             cam.configure(cfg)
             cam.start()
             time.sleep(1.0)
-            log_cam.info("✅ Cámara iniciada con Picamera2 (%dx%d)", FRAME_W, FRAME_H)
+            log_cam.info("✅ Cámara iniciada con Picamera2 (%dx%d, %s)", FRAME_W, FRAME_H, PICAM_FORMAT)
             return cam
         except Exception as e:
             log_cam.warning("No se pudo usar Picamera2: %s", e)
@@ -170,6 +183,7 @@ class CameraSource:
         log_cam.info("Iniciando hilo de cámara...")
         picam = None
         cap = None
+        fails = 0
 
         while not self._stop.is_set():
             # (Re)abrir la fuente si hace falta
@@ -306,7 +320,15 @@ class SpringClient:
     def _send(self, client: httpx.Client, kind: str, url: str, payload: dict):
         t0 = time.monotonic()
         try:
-            r = client.post(url, json=payload)
+            if kind == "sample":
+                # Imagen cruda para el dataset: multipart con el campo "files"
+                r = client.post(
+                    url,
+                    files={"files": (payload["filename"], payload["jpeg"], "image/jpeg")},
+                    timeout=SPRING_UPLOAD_TIMEOUT,
+                )
+            else:
+                r = client.post(url, json=payload)
         except httpx.TransportError as e:
             self.sent_fail += 1
             self._set_state(False, f"{kind}: {type(e).__name__}: {e}")
@@ -321,7 +343,14 @@ class SpringClient:
 
         if r.is_success:
             self.sent_ok += 1
-            log_spr.debug("%s enviado OK (%d, %.0f ms)", kind, r.status_code, ms)
+            if kind == "sample":
+                try:
+                    res = r.json()[0]
+                    log_spr.info("Muestra enviada: %s → %s (%.0f ms)", res.get("fileName"), res.get("status"), ms)
+                except Exception:
+                    log_spr.debug("Muestra enviada (respuesta no interpretable)")
+            else:
+                log_spr.debug("%s enviado OK (%d, %.0f ms)", kind, r.status_code, ms)
         elif r.status_code in (401, 403):
             self.sent_fail += 1
             self._warn_throttled("auth", 30,
@@ -334,7 +363,8 @@ class SpringClient:
                                  r.status_code, kind, ms, r.text[:200])
 
     def _run(self):
-        headers = {"X-Internal-Key": INTERNAL_API_KEY}
+        # La key viaja en TODAS las peticiones (envíos, sondeo y subida de imágenes)
+        headers = {"X-Internal-Key": INTERNAL_API_KEY} if INTERNAL_API_KEY else {}
         log_spr.info("Verificando conexión con Spring en %s ...", SPRING_URL)
         with httpx.Client(timeout=SPRING_TIMEOUT, headers=headers) as client:
             self._probe(client)
@@ -442,6 +472,33 @@ def limpiar_tracks_viejos(max_age_segundos: int = 120):
 
 
 # ──────────────────────────────────────────────────────────────
+# Muestreo de imágenes crudas para el dataset
+# ──────────────────────────────────────────────────────────────
+def next_sample_time() -> float:
+    """Momento de la próxima muestra: intervalo aleatorio entre MIN y MAX."""
+    lo = min(SAMPLE_MIN_S, SAMPLE_MAX_S)
+    hi = max(SAMPLE_MIN_S, SAMPLE_MAX_S)
+    return time.time() + random.uniform(lo, hi)
+
+
+def submit_sample(frame):
+    """Codifica el frame crudo (sin anotaciones) y lo encola para Spring."""
+    # No competir con detecciones/comportamientos si la cola ya está cargada
+    if spring.pending() >= SPRING_QUEUE_MAX // 2:
+        log_inf.debug("Muestra omitida: cola de Spring ocupada")
+        return
+    ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY_SAMPLE])
+    if not ok:
+        log_inf.warning("No se pudo codificar la muestra a JPEG")
+        return
+    spring.submit("sample", SPRING_IMAGES_URL, {
+        "filename": f"cam_{int(time.time())}.jpg",
+        "jpeg": jpeg.tobytes(),
+    })
+    log_inf.info("Muestra para dataset encolada (%.0f KB)", len(jpeg) / 1024)
+
+
+# ──────────────────────────────────────────────────────────────
 # Inferencia (hilo propio, ritmo limitado por INFER_FPS)
 # ──────────────────────────────────────────────────────────────
 def inference_worker():
@@ -454,6 +511,7 @@ def inference_worker():
     last_stats_send = time.time()
     last_summary = time.time()
     no_frame_warned = False
+    next_sample = next_sample_time()
 
     while not stop_event.is_set():
         # Respeta el ritmo máximo de inferencia
@@ -471,6 +529,11 @@ def inference_worker():
         no_frame_warned = False
         last_seq = seq
         last_infer = time.monotonic()
+
+        # Muestra aleatoria para el dataset: frame crudo, ANTES de que YOLO lo procese
+        if SAMPLE_ENABLED and time.time() >= next_sample:
+            submit_sample(frame)
+            next_sample = next_sample_time()
 
         try:
             t0 = time.monotonic()
@@ -546,6 +609,10 @@ async def lifespan(app: FastAPI):
     global yolo
     log.info("Arrancando CUT IA Behavior API")
     log.info("Spring: %s | modelo: %s (conf=%.2f) | INFER_FPS=%.1f", SPRING_URL, MODEL_PATH, MODEL_CONF, INFER_FPS)
+    if SAMPLE_ENABLED:
+        log.info("Muestreo de dataset ACTIVO: cada %.0f-%.0f s → %s", SAMPLE_MIN_S, SAMPLE_MAX_S, SPRING_IMAGES_URL)
+    else:
+        log.info("Muestreo de dataset desactivado (SAMPLE_ENABLED=false)")
 
     if not INTERNAL_API_KEY:
         log.warning("INTERNAL_API_KEY vacía: /stream queda SIN autenticación y Spring puede rechazar los envíos")

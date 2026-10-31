@@ -1,10 +1,9 @@
+
 services:
   python-yolo-service:
     build:
       context: .
       dockerfile: Dockerfile
-      platforms:
-        - linux/arm64
 
     container_name: python-yolo-service
 
@@ -15,10 +14,15 @@ services:
       - PYTHON_YOLO_PORT=${PYTHON_YOLO_PORT:-8000}
       - STREAM_URL=${STREAM_URL:-0}
       - SPRING_URL=${SPRING_URL:-http://localhost:8080}
+      - SPRING_IMAGES_URL=${SPRING_IMAGES_URL}
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+      - SAMPLE_ENABLED=${SAMPLE_ENABLED:-true}
+      - SAMPLE_MIN_S=${SAMPLE_MIN_S:-30}
+      - SAMPLE_MAX_S=${SAMPLE_MAX_S:-120}
+      - JPEG_QUALITY_SAMPLE=${JPEG_QUALITY_SAMPLE:-90}
+      - PICAM_FORMAT=${PICAM_FORMAT:-BGR888}
 
-    # libcamera necesita /dev/media*, /dev/dma_heap y /dev/v4l-subdev*.
-    # privileged los expone todos, por eso ya no se listan devices.
+    # libcamera necesita dispositivos de la Raspberry Pi
     privileged: true
 
     volumes:
